@@ -51,6 +51,7 @@ class SpaceOdysseySimulator:
             n_samples=1,
             evidence=self.initial_state,
             seed=self._next_seed(),
+            show_progress=False,
         ).iloc[0].to_dict()
 
     def _next_seed(self):
@@ -69,6 +70,7 @@ class SpaceOdysseySimulator:
             n_samples=1,
             evidence=self.initial_state,
             seed=self._next_seed(),
+            show_progress=False,
         ).iloc[0].to_dict()
 
     def observe(self, variable):
@@ -127,6 +129,7 @@ class SpaceOdysseySimulator:
             do={variable: value},
             evidence=self._state,
             seed=self._next_seed(),
+            show_progress=False,
         ).iloc[0].to_dict()
         self.action_points -= 2
         self.steps += 1
@@ -156,51 +159,40 @@ class SpaceOdysseySimulator:
         q = self.infer.query(variables=['Crew_Status'], evidence=evidence)
         return float(q.values[crew_status_mapping_to_index['safe']])
 
-    def _inverse_state(self, variable, state):
-        index_to_state, state_to_index = self._get_state_mapping(variable)
-        if len(index_to_state) != 2:
-            raise ValueError(f'Variable {variable} is not binary, cannot invert state.')
-        idx = state_to_index[state]
-        return index_to_state[1 - idx]
-
-    def _apply_switch(self, variable):
-        """Apply switch action as inversion of current true state in simulator."""
-        current_state = self._state[variable]
-        target_state = self._inverse_state(variable, current_state)
-        self.act(variable, target_state)
-        return target_state
-
     def _expected_p_safe_after_switch(self, evidence, switch):
-        posterior = self.infer.query(variables=[switch], evidence=evidence)
-        states = posterior.state_names[switch]
-        state_to_index = {state: idx for idx, state in enumerate(states)}
-
-        expected = 0.0
-        for state in states:
-            p_state = float(posterior.values[state_to_index[state]])
-            switched_state = self._inverse_state(switch, state)
-            switched_evidence = {**evidence, switch: switched_state}
-            expected += p_state * self._p_safe(switched_evidence)
-        return expected
+        mapping = self._get_state_mapping(switch)[0]
+        return max(
+            self._p_safe({**evidence, switch: value})
+            for value in mapping.values()
+        )
 
     def _expected_p_safe_after_two_switches(self, evidence, switch1, switch2):
-        posterior = self.infer.query(variables=[switch1, switch2], evidence=evidence)
-        states1 = posterior.state_names[switch1]
-        states2 = posterior.state_names[switch2]
-        idx1 = {state: i for i, state in enumerate(states1)}
-        idx2 = {state: i for i, state in enumerate(states2)}
+        mapping1 = self._get_state_mapping(switch1)[0]
+        mapping2 = self._get_state_mapping(switch2)[0]
 
-        expected = 0.0
-        for state1 in states1:
-            for state2 in states2:
-                p_joint = float(posterior.values[idx1[state1], idx2[state2]])
-                switched_evidence = {
-                    **evidence,
-                    switch1: self._inverse_state(switch1, state1),
-                    switch2: self._inverse_state(switch2, state2),
-                }
-                expected += p_joint * self._p_safe(switched_evidence)
-        return expected
+        best = -1.0
+        for value1 in mapping1.values():
+            for value2 in mapping2.values():
+                prob = self._p_safe({**evidence, switch1: value1, switch2: value2})
+                if prob > best:
+                    best = prob
+        return best
+
+    def _best_assignment_for_two_switches(self, evidence, switch1, switch2):
+        mapping1 = self._get_state_mapping(switch1)[0]
+        mapping2 = self._get_state_mapping(switch2)[0]
+
+        best_pair = None
+        best_prob = -1.0
+        for val1 in mapping1.values():
+            for val2 in mapping2.values():
+                candidate_evidence = {**evidence, switch1: val1, switch2: val2}
+                prob = self._p_safe(candidate_evidence)
+                if prob > best_prob:
+                    best_prob = prob
+                    best_pair = (val1, val2)
+
+        return best_pair, best_prob
 
     def _find_best_two_switches(self, evidence):
         best_switches = None
@@ -256,10 +248,13 @@ class SpaceOdysseySimulator:
         best_prob = self._p_safe(evidence)
 
         for switch in sorted(self.do_vars - set(excluded_switches)):
-            prob = self._expected_p_safe_after_switch(evidence, switch)
-            if prob > best_prob + 1e-12:
-                best_prob = prob
-                best_action = switch
+            mapping = self._get_state_mapping(switch)[0]
+            for value in mapping.values():
+                candidate_evidence = {**evidence, switch: value}
+                prob = self._p_safe(candidate_evidence)
+                if prob > best_prob + 1e-12:
+                    best_prob = prob
+                    best_action = (switch, value)
 
         return best_action, best_prob
 
@@ -302,72 +297,48 @@ class SpaceOdysseySimulator:
         best_expected_prob = baseline_prob
 
         for first_switch in sorted(self.do_vars):
-            posterior_first = self.infer.query(variables=[first_switch], evidence=evidence)
-            first_states = posterior_first.state_names[first_switch]
-            first_state_to_idx = {state: idx for idx, state in enumerate(first_states)}
+            mapping = self._get_state_mapping(first_switch)[0]
+            for first_value in mapping.values():
+                evidence_after_first = {**evidence, first_switch: first_value}
 
-            if not available_observes:
-                expected_prob = 0.0
-                for state in first_states:
-                    p_state = float(posterior_first.values[first_state_to_idx[state]])
-                    switched_evidence = {**evidence, first_switch: self._inverse_state(first_switch, state)}
-                    _, branch_prob = self._find_best_single_switch(
-                        switched_evidence,
+                if not available_observes:
+                    _, expected_prob = self._find_best_single_switch(
+                        evidence_after_first,
                         excluded_switches={first_switch},
                     )
-                    expected_prob += p_state * branch_prob
+                    if expected_prob > best_expected_prob + 1e-12:
+                        best_expected_prob = expected_prob
+                        best_plan = {
+                            'first_switch': (first_switch, first_value),
+                            'observe_var': None,
+                            'expected_prob': expected_prob,
+                            'observe_details': None,
+                        }
+                    continue
 
-                if expected_prob > best_expected_prob + 1e-12:
-                    best_expected_prob = expected_prob
-                    best_plan = {
-                        'first_switch': first_switch,
-                        'observe_var': None,
-                        'expected_prob': expected_prob,
-                        'observe_details': None,
-                    }
-                continue
-
-            best_observe_for_first = None
-            for observe_var in available_observes:
-                expected_prob = 0.0
-                weighted_gain = 0.0
-                weighted_improve = 0.0
-
-                for state in first_states:
-                    p_state = float(posterior_first.values[first_state_to_idx[state]])
-                    switched_evidence = {**evidence, first_switch: self._inverse_state(first_switch, state)}
+                best_observe_for_first = None
+                for observe_var in available_observes:
                     observe_report = self._expected_best_single_after_observe(
-                        switched_evidence,
+                        evidence_after_first,
                         observe_var,
                         excluded_switches={first_switch},
                     )
-                    expected_prob += p_state * observe_report['expected_prob_after_observe']
-                    weighted_gain += p_state * observe_report['expected_gain']
-                    weighted_improve += p_state * observe_report['prob_of_improvement']
+                    if (
+                        best_observe_for_first is None
+                        or observe_report['expected_prob_after_observe']
+                        > best_observe_for_first['expected_prob_after_observe'] + 1e-12
+                    ):
+                        best_observe_for_first = observe_report
 
-                candidate = {
-                    'observe_var': observe_var,
-                    'expected_prob_after_observe': expected_prob,
-                    'expected_gain': weighted_gain,
-                    'prob_of_improvement': weighted_improve,
-                }
-
-                if (
-                    best_observe_for_first is None
-                    or candidate['expected_prob_after_observe']
-                    > best_observe_for_first['expected_prob_after_observe'] + 1e-12
-                ):
-                    best_observe_for_first = candidate
-
-            expected_prob = best_observe_for_first['expected_prob_after_observe']
-            if expected_prob > best_expected_prob + 1e-12:
-                best_expected_prob = expected_prob
-                best_plan = {
-                    'first_switch': first_switch,
-                    'observe_var': best_observe_for_first['observe_var'],
-                    'expected_prob': expected_prob,
-                    'observe_details': best_observe_for_first,
-                }
+                expected_prob = best_observe_for_first['expected_prob_after_observe']
+                if expected_prob > best_expected_prob + 1e-12:
+                    best_expected_prob = expected_prob
+                    best_plan = {
+                        'first_switch': (first_switch, first_value),
+                        'observe_var': best_observe_for_first['observe_var'],
+                        'expected_prob': expected_prob,
+                        'observe_details': best_observe_for_first,
+                    }
 
         return {
             'baseline_prob': baseline_prob,
@@ -530,16 +501,19 @@ class SpaceOdysseySimulator:
             return report
 
         switch1, switch2 = best_two_switches
-        print(f'Planned action 1: switch {switch1} (invert state)')
-        self._apply_switch(switch1)
-        print(f'Planned action 2: switch {switch2} (invert state)')
-        self._apply_switch(switch2)
+        (value1, value2), p_after_actions = self._best_assignment_for_two_switches(
+            evidence_after_observe, switch1, switch2
+        )
+        print(f'Planned action 1: {switch1} -> {value1}')
+        self.act(switch1, value1)
+        print(f'Planned action 2: {switch2} -> {value2}')
+        self.act(switch2, value2)
         print(f'Estimated P(Crew_Status=safe) after plan: {p_after_actions:.6f}')
 
         return {
             **report,
             'observed': (best['observe_var'], observed_value),
-            'actions': [(switch1, 'invert'), (switch2, 'invert')],
+            'actions': [(switch1, value1), (switch2, value2)],
             'estimated_p_safe_after_actions': p_after_actions,
         }
 
@@ -551,13 +525,13 @@ class SpaceOdysseySimulator:
             print('No profitable switch->observe->switch plan found.')
             return plan_report
 
-        first_switch = best_plan['first_switch']
+        first_switch, first_value = best_plan['first_switch']
         print('=== Running Strategy: switch -> observe -> switch ===')
         print(
-            f'Planned action 1: switch {first_switch} (invert state) '
+            f'Planned action 1: {first_switch} -> {first_value} '
             f"(expected final P(Crew_Status=safe)={best_plan['expected_prob']:.6f})"
         )
-        self._apply_switch(first_switch)
+        self.act(first_switch, first_value)
 
         observed = None
         if best_plan['observe_var'] is not None:
@@ -574,19 +548,19 @@ class SpaceOdysseySimulator:
             return {
                 **plan_report,
                 'observed': observed,
-                'actions': [(first_switch, 'invert')],
+                'actions': [(first_switch, first_value)],
                 'estimated_p_safe_after_actions': self._p_safe(dict(self.known_evidence)),
             }
 
-        second_switch = second_action
-        print(f'Planned action 2: switch {second_switch} (invert state)')
-        self._apply_switch(second_switch)
+        second_switch, second_value = second_action
+        print(f'Planned action 2: {second_switch} -> {second_value}')
+        self.act(second_switch, second_value)
         print(f'Estimated P(Crew_Status=safe) after plan: {second_prob:.6f}')
 
         return {
             **plan_report,
             'observed': observed,
-            'actions': [(first_switch, 'invert'), (second_switch, 'invert')],
+            'actions': [(first_switch, first_value), second_action],
             'estimated_p_safe_after_actions': second_prob,
         }
 
@@ -628,14 +602,14 @@ class SpaceOdysseySimulator:
                 'estimated_p_safe_after_actions': self._p_safe(dict(self.known_evidence)),
             }
 
-        switch = best_switch_action
-        print(f'Planned final action: switch {switch} (invert state)')
-        self._apply_switch(switch)
+        switch, value = best_switch_action
+        print(f'Planned final action: {switch} -> {value}')
+        self.act(switch, value)
         print(f'Estimated P(Crew_Status=safe) after plan: {best_prob:.6f}')
 
         return {
             'observed': observed_steps,
-            'actions': [(switch, 'invert')],
+            'actions': [best_switch_action],
             'estimated_p_safe_after_actions': best_prob,
         }
 
