@@ -1,0 +1,196 @@
+network unknown {
+}
+variable AI_Test {
+    type discrete [ 2 ] { fail, pass };
+}
+variable Alert_System {
+    type discrete [ 2 ] { silent, warning };
+}
+variable Alien_Attack {
+    type discrete [ 2 ] { no, yes };
+}
+variable CO2_Level {
+    type discrete [ 3 ] { high, low, normal };
+}
+variable CO2_Scrubber {
+    type discrete [ 2 ] { faulty, ok };
+}
+variable Crew_Status {
+    type discrete [ 2 ] { dead, safe };
+}
+variable Decompression {
+    type discrete [ 2 ] { no, yes };
+}
+variable Diagnosis {
+    type discrete [ 2 ] { anomaly, nominal };
+}
+variable HAL {
+    type discrete [ 3 ] { normal, offline, sabotage };
+}
+variable HAL_Switch {
+    type discrete [ 2 ] { off, on };
+}
+variable Life_Support {
+    type discrete [ 3 ] { critical, degraded, stable };
+}
+variable Manoeuvre {
+    type discrete [ 2 ] { evasive, none };
+}
+variable Meteor_Shower {
+    type discrete [ 2 ] { no, yes };
+}
+variable O2_Generator {
+    type discrete [ 2 ] { faulty, ok };
+}
+variable O2_Level {
+    type discrete [ 2 ] { low, normal };
+}
+variable Porthole {
+    type discrete [ 2 ] { clear, danger };
+}
+variable System_Age {
+    type discrete [ 2 ] { new, old };
+}
+variable Temperature {
+    type discrete [ 3 ] { cold, hot, normal };
+}
+variable Thermostat {
+    type discrete [ 2 ] { faulty, ok };
+}
+probability ( AI_Test | HAL ) {
+    ( normal ) 0.045239825581395346, 0.9547601744186046;
+    ( offline ) 0.21197411003236247, 0.7880258899676376;
+    ( sabotage ) 0.9149746192893401, 0.0850253807106599;
+
+}
+probability ( Alert_System | Alien_Attack, Meteor_Shower ) {
+    ( no, no ) 0.9905709795704557, 0.009429020429544265;
+    ( no, yes ) 0.291368884002199, 0.708631115997801;
+    ( yes, no ) 0.20018930430667298, 0.7998106956933271;
+    ( yes, yes ) 0.01466275659824047, 0.9853372434017595;
+
+}
+probability ( Alien_Attack | Manoeuvre ) {
+    ( evasive ) 0.6395498392282958, 0.36045016077170416;
+    ( none ) 0.9439153439153439, 0.056084656084656084;
+
+}
+probability ( CO2_Level | CO2_Scrubber, Decompression ) {
+    ( faulty, no ) 0.6428571428571429, 0.049886621315192746, 0.3072562358276644;
+    ( faulty, yes ) 0.5929203539823009, 0.3008849557522124, 0.10619469026548672;
+    ( ok, no ) 0.04916336035880628, 0.050198378471623256, 0.9006382611695705;
+    ( ok, yes ) 0.3956082258626699, 0.3949111188567445, 0.20948065528058557;
+
+}
+probability ( CO2_Scrubber | HAL, System_Age ) {
+    ( normal, new ) 0.019964349376114084, 0.9800356506238859;
+    ( normal, old ) 0.15487217487958505, 0.845127825120415;
+    ( offline, new ) 0.04319300164024057, 0.9568069983597595;
+    ( offline, old ) 0.18999467802022352, 0.8100053219797765;
+    ( sabotage, new ) 0.3730964467005076, 0.6269035532994924;
+    ( sabotage, old ) 0.7030456852791879, 0.2969543147208122;
+
+}
+probability ( Crew_Status | Alien_Attack, Life_Support ) {
+    ( no, critical ) 0.6030483764082174, 0.39695162359178265;
+    ( no, degraded ) 0.15584988962472407, 0.844150110375276;
+    ( no, stable ) 0.012195121951219513, 0.9878048780487805;
+    ( yes, critical ) 0.9590417310664606, 0.04095826893353941;
+    ( yes, degraded ) 0.5712121212121212, 0.4287878787878788;
+    ( yes, stable ) 0.262, 0.738;
+
+}
+probability ( Decompression | Alien_Attack, Meteor_Shower ) {
+    ( no, no ) 0.9914440370176357, 0.008555962982364239;
+    ( no, yes ) 0.19626168224299065, 0.8037383177570093;
+    ( yes, no ) 0.28963558920965454, 0.7103644107903455;
+    ( yes, yes ) 0.093841642228739, 0.906158357771261;
+
+}
+probability ( Diagnosis | System_Age ) {
+    ( new ) 0.10083532219570406, 0.899164677804296;
+    ( old ) 0.39440868865647627, 0.6055913113435237;
+
+}
+probability ( HAL | HAL_Switch ) {
+    ( off ) 0.0, 0.9925925925925926, 0.007407407407407408;
+    ( on ) 0.6901567398119123, 0.2129153605015674, 0.09692789968652038;
+
+}
+probability ( HAL_Switch ) {
+    table 0.2025, 0.7975 ;
+}
+probability ( Life_Support | CO2_Level, O2_Level, Temperature ) {
+    ( high, low, cold ) 0.9935587761674718, 0.00644122383252818, 0.0;
+    ( high, low, hot ) 0.9836065573770492, 0.01639344262295082, 0.0;
+    ( high, low, normal ) 0.9925373134328358, 0.007462686567164179, 0.0;
+    ( high, normal, cold ) 0.9933333333333333, 0.006666666666666667, 0.0;
+    ( high, normal, hot ) 0.9908256880733946, 0.009174311926605505, 0.0;
+    ( high, normal, normal ) 0.0015625, 0.9953125, 0.003125;
+    ( low, low, cold ) 0.9860383944153578, 0.013961605584642234, 0.0;
+    ( low, low, hot ) 0.9863013698630136, 0.0136986301369863, 0.0;
+    ( low, low, normal ) 0.0, 0.9931740614334471, 0.006825938566552901;
+    ( low, normal, cold ) 0.0, 1.0, 0.0;
+    ( low, normal, hot ) 0.0, 1.0, 0.0;
+    ( low, normal, normal ) 0.0, 0.009202453987730062, 0.99079754601227;
+    ( normal, low, cold ) 0.9913793103448276, 0.008620689655172414, 0.0;
+    ( normal, low, hot ) 0.986013986013986, 0.013986013986013986, 0.0;
+    ( normal, low, normal ) 0.0, 0.9967793880837359, 0.00322061191626409;
+    ( normal, normal, cold ) 0.0030534351145038168, 0.9954198473282443, 0.0015267175572519084;
+    ( normal, normal, hot ) 0.007594936708860759, 0.9898734177215189, 0.002531645569620253;
+    ( normal, normal, normal ) 0.0, 0.009550138225684845, 0.9904498617743152;
+
+}
+probability ( Manoeuvre | HAL ) {
+    ( normal ) 0.8006904069767442, 0.19930959302325582;
+    ( offline ) 0.48705501618122976, 0.5129449838187702;
+    ( sabotage ) 0.008883248730964468, 0.9911167512690355;
+
+}
+probability ( Meteor_Shower | Manoeuvre ) {
+    ( evasive ) 0.895176848874598, 0.10482315112540193;
+    ( none ) 0.6010582010582011, 0.39894179894179893;
+
+}
+probability ( O2_Generator | HAL, System_Age ) {
+    ( normal, new ) 0.02459893048128342, 0.9754010695187165;
+    ( normal, old ) 0.1459799925898481, 0.8540200074101519;
+    ( offline, new ) 0.04866047020229634, 0.9513395297977036;
+    ( offline, old ) 0.18573709419904205, 0.814262905800958;
+    ( sabotage, new ) 0.4263959390862944, 0.5736040609137056;
+    ( sabotage, old ) 0.6979695431472082, 0.3020304568527919;
+
+}
+probability ( O2_Level | Decompression, O2_Generator ) {
+    ( no, faulty ) 0.606651376146789, 0.393348623853211;
+    ( no, ok ) 0.050111933872912004, 0.949888066127088;
+    ( yes, faulty ) 0.9851694915254238, 0.014830508474576272;
+    ( yes, ok ) 0.7177957177957178, 0.28220428220428223;
+
+}
+probability ( Porthole | Alien_Attack, Meteor_Shower ) {
+    ( no, no ) 0.9009952854897852, 0.09900471451021477;
+    ( no, yes ) 0.41286421110500277, 0.5871357888949973;
+    ( yes, no ) 0.5073355418835779, 0.4926644581164221;
+    ( yes, yes ) 0.09090909090909091, 0.9090909090909091;
+
+}
+probability ( System_Age ) {
+    table 0.5028, 0.4972 ;
+}
+probability ( Temperature | Decompression, Thermostat ) {
+    ( no, faulty ) 0.2725118483412322, 0.31635071090047395, 0.41113744075829384;
+    ( no, ok ) 0.09820051413881747, 0.04661525278491859, 0.8551842330762639;
+    ( yes, faulty ) 0.43935926773455375, 0.482837528604119, 0.07780320366132723;
+    ( yes, ok ) 0.5863384188626907, 0.1050624133148405, 0.30859916782246877;
+
+}
+probability ( Thermostat | HAL, System_Age ) {
+    ( normal, new ) 0.017825311942959002, 0.982174688057041;
+    ( normal, old ) 0.1400518710633568, 0.8599481289366432;
+    ( offline, new ) 0.046473482777474026, 0.953526517222526;
+    ( offline, old ) 0.18680149015433742, 0.8131985098456626;
+    ( sabotage, new ) 0.3883248730964467, 0.6116751269035533;
+    ( sabotage, old ) 0.6700507614213198, 0.3299492385786802;
+
+}
