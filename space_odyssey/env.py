@@ -4,6 +4,8 @@ from pgmpy.readwrite import BIFReader
 import logging
 import random
 import networkx as nx
+from collections import deque
+from typing import FrozenSet, Tuple, Dict, Set
 
 
 logging.getLogger('pgmpy').setLevel(logging.ERROR)
@@ -20,6 +22,98 @@ DO_VARS =  {
 HIDDEN_VARS = {'HAL', 'System_Age', 'Life_Support', 'Meteor_Shower', 'Alien_Attack'}
 TARGET_VARS = {'Crew_Status'}
 ACTION_POINTS = 5
+
+
+class GraphMarkovDecisionProcess:
+    """
+    Граф состояний и действий для MDP.
+    
+    Состояние: frozenset известных (наблюдаемых) переменных и их значений
+    Действие: (переменная из do_vars, значение)
+    Переход: разновидность do-исчисления - действие делает неизвестными 
+            все obs_vars, которые являются потомками изменяемой переменной
+    """
+    
+    def __init__(self, model: DiscreteBayesianNetwork):
+        """
+        :param model: объект DiscreteBayesianNetwork с полной структурой ребер
+        """
+        self.model = model
+        self.obs_vars = OBS_VARS
+        self.do_vars = DO_VARS
+        
+        self.graph_nx = nx.DiGraph()
+        for parent, child in model.edges():
+            self.graph_nx.add_edge(parent, child)
+        
+        self._descendants_cache = {}
+        for var in self.do_vars:
+            self._descendants_cache[var] = self._compute_descendants(var)
+    
+    def _compute_descendants(self, node: str) -> Set[str]:
+        """
+        Найти всех потомков узла в DAG
+        """
+        descendants = set()
+        queue = deque([node])
+        visited = {node}
+        
+        while queue:
+            current = queue.popleft()
+            for successor in self.graph_nx.successors(current):
+                if successor not in visited:
+                    visited.add(successor)
+                    descendants.add(successor)
+                    queue.append(successor)
+        
+        return descendants
+    
+    def get_obs_descendants(self, do_var: str) -> Set[str]:
+        """
+        Получить все obs_vars, которые являются потомками do_var
+        """
+        descendants = self._descendants_cache[do_var]
+        return descendants & self.obs_vars
+    
+    def get_possible_actions(self) -> list:
+        """
+        Получить все возможные действия (переменная, значение).
+        Значения берутся из реальных state_names узла, а не из индексов.
+        """
+        actions = []
+        for var in self.do_vars:
+            states = self.model.get_cpds(var).state_names[var]
+            for value in states:
+                actions.append((var, value))
+        return actions
+    
+    def get_next_state(self, current_state: Dict, action: Tuple[str, str]) -> Dict:
+        """
+        Вычислить новое состояние после действия.
+        Действие делает неизвестными все obs_vars-потомки do_var.
+        
+        :param current_state: dict {переменная: значение} для известных переменных
+        :param action: (do_var, value)
+        :return: новое состояние (новые неизвестные переменные удалены)
+        """
+        do_var, value = action
+        new_state = dict(current_state)
+        
+        affected_obs = self.get_obs_descendants(do_var)
+        
+        for obs_var in affected_obs:
+            new_state.pop(obs_var, None)
+        
+        return new_state
+    
+    def get_state_description(self, state: Dict) -> str:
+        """
+        Описать состояние в читаемом виде
+        """
+        if not state:
+            return "No observations"
+        items = [f"{var}={val}" for var, val in sorted(state.items())]
+        return ", ".join(items)
 
 
 class SpaceOdysseySimulator:
@@ -40,12 +134,12 @@ class SpaceOdysseySimulator:
         self.target_vars = TARGET_VARS
         self.start_action_points = ACTION_POINTS
         self.infer = VariableElimination(self.model)
+        
+        self.graph = GraphMarkovDecisionProcess(self.model)
 
         self.steps = 0
-        # track available action points
         self.action_points = self.start_action_points
         self.known_evidence = dict(initial_state) if initial_state else {}
-        # initialize state
         self.initial_state = initial_state
         self._state = self.model.simulate(
             n_samples=1,
@@ -159,557 +253,288 @@ class SpaceOdysseySimulator:
         q = self.infer.query(variables=['Crew_Status'], evidence=evidence)
         return float(q.values[crew_status_mapping_to_index['safe']])
 
-    def _expected_p_safe_after_switch(self, evidence, switch):
-        mapping = self._get_state_mapping(switch)[0]
-        return max(
-            self._p_safe({**evidence, switch: value})
-            for value in mapping.values()
-        )
+    def _state_prior_p_safe(self, evidence):
+        """Prior probability P(Crew_Status=safe) for a state (known evidence)."""
+        return self._p_safe(evidence)
 
-    def _expected_p_safe_after_two_switches(self, evidence, switch1, switch2):
-        mapping1 = self._get_state_mapping(switch1)[0]
-        mapping2 = self._get_state_mapping(switch2)[0]
+    def _evidence_after_do(self, evidence, do_var, do_value):
+        """Apply abstract graph transition for do-action over known evidence."""
+        next_evidence = dict(evidence)
+        for obs_var in self.get_obs_descendants_of_do_var(do_var):
+            next_evidence.pop(obs_var, None)
+        next_evidence[do_var] = do_value
+        return next_evidence
 
-        best = -1.0
-        for value1 in mapping1.values():
-            for value2 in mapping2.values():
-                prob = self._p_safe({**evidence, switch1: value1, switch2: value2})
-                if prob > best:
-                    best = prob
-        return best
+    def _expected_prior_after_action(self, evidence, action):
+        """
+        Expected prior P(Crew_Status=safe) in the next graph node after action.
+        Observe action is stochastic and uses expectation over observation posterior.
+        Do action is deterministic in this abstract MDP graph.
+        """
+        kind = action['kind']
+        if kind == 'observe':
+            observe_var = action['var']
+            posterior = self.infer.query(variables=[observe_var], evidence=evidence)
+            state_to_index = {
+                state: idx for idx, state in enumerate(posterior.state_names[observe_var])
+            }
 
-    def _best_assignment_for_two_switches(self, evidence, switch1, switch2):
-        mapping1 = self._get_state_mapping(switch1)[0]
-        mapping2 = self._get_state_mapping(switch2)[0]
+            expected_prob = 0.0
+            for state in posterior.state_names[observe_var]:
+                state_prob = float(posterior.values[state_to_index[state]])
+                next_evidence = {**evidence, observe_var: state}
+                expected_prob += state_prob * self._state_prior_p_safe(next_evidence)
+            return expected_prob
 
-        best_pair = None
-        best_prob = -1.0
-        for val1 in mapping1.values():
-            for val2 in mapping2.values():
-                candidate_evidence = {**evidence, switch1: val1, switch2: val2}
-                prob = self._p_safe(candidate_evidence)
-                if prob > best_prob:
-                    best_prob = prob
-                    best_pair = (val1, val2)
-
-        return best_pair, best_prob
-
-    def _find_best_two_switches(self, evidence):
-        best_switches = None
-        best_prob = self._p_safe(evidence)
-
-        do_vars = sorted(list(self.do_vars))
-        for i in range(len(do_vars)):
-            for j in range(i + 1, len(do_vars)):
-                switch1 = do_vars[i]
-                switch2 = do_vars[j]
-                pair_best_prob = self._expected_p_safe_after_two_switches(
-                    evidence,
-                    switch1,
-                    switch2,
-                )
-
-                if pair_best_prob > best_prob + 1e-12:
-                    best_prob = pair_best_prob
-                    best_switches = (switch1, switch2)
-
-        return best_switches, best_prob
-
-    def _evaluate_observation_candidate(self, evidence, observe_var, baseline_two_switch_prob):
-        posterior = self.infer.query(variables=[observe_var], evidence=evidence)
-        state_to_index = {
-            state: idx for idx, state in enumerate(posterior.state_names[observe_var])
-        }
-
-        expected_prob_after_observe = 0.0
-        prob_of_improvement = 0.0
-
-        for state in posterior.state_names[observe_var]:
-            state_prob = float(posterior.values[state_to_index[state]])
-            evidence_after_observe = {**evidence, observe_var: state}
-            _, best_prob_after_observe = self._find_best_two_switches(evidence_after_observe)
-
-            gain = best_prob_after_observe - baseline_two_switch_prob
-            if gain > 1e-12:
-                prob_of_improvement += state_prob
-
-            expected_prob_after_observe += state_prob * best_prob_after_observe
-
-        return {
-            'observe_var': observe_var,
-            'expected_prob_after_observe': expected_prob_after_observe,
-            'expected_gain': expected_prob_after_observe - baseline_two_switch_prob,
-            'prob_of_improvement': prob_of_improvement,
-        }
-
-    def _find_best_single_switch(self, evidence, excluded_switches=None):
-        excluded_switches = excluded_switches or set()
-        best_action = None
-        best_prob = self._p_safe(evidence)
-
-        for switch in sorted(self.do_vars - set(excluded_switches)):
-            mapping = self._get_state_mapping(switch)[0]
-            for value in mapping.values():
-                candidate_evidence = {**evidence, switch: value}
-                prob = self._p_safe(candidate_evidence)
-                if prob > best_prob + 1e-12:
-                    best_prob = prob
-                    best_action = (switch, value)
-
-        return best_action, best_prob
-
-    def _expected_best_single_after_observe(self, evidence, observe_var, excluded_switches=None):
-        baseline_prob = self._find_best_single_switch(
-            evidence, excluded_switches=excluded_switches
-        )[1]
-        posterior = self.infer.query(variables=[observe_var], evidence=evidence)
-        state_to_index = {
-            state: idx for idx, state in enumerate(posterior.state_names[observe_var])
-        }
-
-        expected_prob = 0.0
-        prob_of_improvement = 0.0
-        for state in posterior.state_names[observe_var]:
-            state_prob = float(posterior.values[state_to_index[state]])
-            candidate_evidence = {**evidence, observe_var: state}
-            _, best_prob_after_observe = self._find_best_single_switch(
-                candidate_evidence,
-                excluded_switches=excluded_switches,
-            )
-            expected_prob += state_prob * best_prob_after_observe
-            if best_prob_after_observe > baseline_prob + 1e-12:
-                prob_of_improvement += state_prob
-
-        return {
-            'observe_var': observe_var,
-            'expected_prob_after_observe': expected_prob,
-            'expected_gain': expected_prob - baseline_prob,
-            'prob_of_improvement': prob_of_improvement,
-        }
-
-    def choose_plan_switch_observe_switch(self):
-        """Plan first switch and best follow-up observe for switch->observe->switch."""
-        evidence = dict(self.known_evidence)
-        baseline_prob = self._p_safe(evidence)
-        available_observes = sorted(list(self.obs_vars - set(evidence.keys())))
-
-        best_plan = None
-        best_expected_prob = baseline_prob
-
-        for first_switch in sorted(self.do_vars):
-            mapping = self._get_state_mapping(first_switch)[0]
-            for first_value in mapping.values():
-                evidence_after_first = {**evidence, first_switch: first_value}
-
-                if not available_observes:
-                    _, expected_prob = self._find_best_single_switch(
-                        evidence_after_first,
-                        excluded_switches={first_switch},
-                    )
-                    if expected_prob > best_expected_prob + 1e-12:
-                        best_expected_prob = expected_prob
-                        best_plan = {
-                            'first_switch': (first_switch, first_value),
-                            'observe_var': None,
-                            'expected_prob': expected_prob,
-                            'observe_details': None,
-                        }
-                    continue
-
-                best_observe_for_first = None
-                for observe_var in available_observes:
-                    observe_report = self._expected_best_single_after_observe(
-                        evidence_after_first,
-                        observe_var,
-                        excluded_switches={first_switch},
-                    )
-                    if (
-                        best_observe_for_first is None
-                        or observe_report['expected_prob_after_observe']
-                        > best_observe_for_first['expected_prob_after_observe'] + 1e-12
-                    ):
-                        best_observe_for_first = observe_report
-
-                expected_prob = best_observe_for_first['expected_prob_after_observe']
-                if expected_prob > best_expected_prob + 1e-12:
-                    best_expected_prob = expected_prob
-                    best_plan = {
-                        'first_switch': (first_switch, first_value),
-                        'observe_var': best_observe_for_first['observe_var'],
-                        'expected_prob': expected_prob,
-                        'observe_details': best_observe_for_first,
-                    }
-
-        return {
-            'baseline_prob': baseline_prob,
-            'best_plan': best_plan,
-        }
-
-    def _best_expected_prob_after_k_observes_then_switch(
-        self,
-        evidence,
-        available_observes,
-        remaining_observes,
-        excluded_switches=None,
-        cache=None,
-    ):
-        excluded_switches = excluded_switches or set()
-        cache = cache if cache is not None else {}
-        key = (
-            tuple(sorted(evidence.items())),
-            tuple(sorted(available_observes)),
-            remaining_observes,
-            tuple(sorted(excluded_switches)),
-        )
-        if key in cache:
-            return cache[key]
-
-        if remaining_observes == 0 or not available_observes:
-            result = self._find_best_single_switch(
+        if kind == 'do':
+            next_evidence = self._evidence_after_do(
                 evidence,
-                excluded_switches=excluded_switches,
-            )[1]
-            cache[key] = result
-            return result
+                action['var'],
+                action['value'],
+            )
+            return self._state_prior_p_safe(next_evidence)
 
-        best_expected = -1.0
-        for observe_var in available_observes:
-            posterior = self.infer.query(variables=[observe_var], evidence=evidence)
-            state_to_index = {
-                state: idx for idx, state in enumerate(posterior.state_names[observe_var])
-            }
-            next_available = tuple(v for v in available_observes if v != observe_var)
+        raise ValueError(f"Unknown action kind: {kind}")
 
-            expected_prob = 0.0
-            for state in posterior.state_names[observe_var]:
-                state_prob = float(posterior.values[state_to_index[state]])
-                next_evidence = {**evidence, observe_var: state}
-                expected_prob += state_prob * self._best_expected_prob_after_k_observes_then_switch(
-                    next_evidence,
-                    next_available,
-                    remaining_observes - 1,
-                    excluded_switches=excluded_switches,
-                    cache=cache,
-                )
+    def _build_available_actions(self, evidence, action_points):
+        """Build all feasible actions under the current points budget."""
+        actions = []
 
-            if expected_prob > best_expected:
-                best_expected = expected_prob
+        if action_points >= 1:
+            unknown_obs_vars = sorted(self.obs_vars - set(evidence.keys()))
+            for obs_var in unknown_obs_vars:
+                actions.append({
+                    'kind': 'observe',
+                    'var': obs_var,
+                    'cost': 1,
+                })
 
-        cache[key] = best_expected
-        return best_expected
+        if action_points >= 2:
+            for do_var in sorted(self.do_vars):
+                idx_to_state = self._get_state_mapping(do_var)[0]
+                for do_value in idx_to_state.values():
+                    actions.append({
+                        'kind': 'do',
+                        'var': do_var,
+                        'value': do_value,
+                        'cost': 2,
+                    })
 
-    def _choose_best_observe_for_remaining_depth(
-        self,
-        evidence,
-        available_observes,
-        remaining_observes,
-        excluded_switches=None,
-    ):
-        excluded_switches = excluded_switches or set()
-        baseline = self._best_expected_prob_after_k_observes_then_switch(
-            evidence,
-            available_observes,
-            remaining_observes - 1,
-            excluded_switches=excluded_switches,
-            cache={},
-        )
+        return actions
 
-        best = None
-        for observe_var in available_observes:
-            posterior = self.infer.query(variables=[observe_var], evidence=evidence)
-            state_to_index = {
-                state: idx for idx, state in enumerate(posterior.state_names[observe_var])
-            }
-            next_available = tuple(v for v in available_observes if v != observe_var)
-
-            expected_prob = 0.0
-            prob_of_improvement = 0.0
-            for state in posterior.state_names[observe_var]:
-                state_prob = float(posterior.values[state_to_index[state]])
-                next_evidence = {**evidence, observe_var: state}
-                value = self._best_expected_prob_after_k_observes_then_switch(
-                    next_evidence,
-                    next_available,
-                    remaining_observes - 1,
-                    excluded_switches=excluded_switches,
-                    cache={},
-                )
-                expected_prob += state_prob * value
-                if value > baseline + 1e-12:
-                    prob_of_improvement += state_prob
-
-            candidate = {
-                'observe_var': observe_var,
-                'expected_prob': expected_prob,
-                'expected_gain': expected_prob - baseline,
-                'prob_of_improvement': prob_of_improvement,
-            }
-            if best is None or candidate['expected_prob'] > best['expected_prob'] + 1e-12:
-                best = candidate
-
-        return best
-
-    def choose_best_observation_for_oss(self):
-        """Select best first observe for observe->switch->switch strategy."""
+    def choose_best_next_action_by_prior(self):
+        """
+        Choose the next graph edge from current node by maximum prior score.
+        Node: known evidence; edge: observe/do action with cost constraints.
+        """
         evidence = dict(self.known_evidence)
-        baseline_two_switches, baseline_two_switch_prob = self._find_best_two_switches(evidence)
+        current_prior = self._state_prior_p_safe(evidence)
+        candidates = self._build_available_actions(evidence, self.action_points)
 
-        candidates = sorted(list(self.obs_vars - set(evidence.keys())))
         if not candidates:
             return {
-                'baseline_two_switches': baseline_two_switches,
-                'baseline_two_switch_prob': baseline_two_switch_prob,
-                'best_observe': None,
+                'current_prior': current_prior,
+                'best': None,
                 'ranked': [],
             }
 
-        ranked = [
-            self._evaluate_observation_candidate(evidence, observe_var, baseline_two_switch_prob)
-            for observe_var in candidates
-        ]
-        ranked.sort(key=lambda x: x['expected_prob_after_observe'], reverse=True)
+        ranked = []
+        for action in candidates:
+            expected_prior = self._expected_prior_after_action(evidence, action)
+            ranked.append({
+                'action': action,
+                'expected_prior': expected_prior,
+                'gain': expected_prior - current_prior,
+            })
+
+        # Maximize expected prior; then maximize gain; then prefer cheaper action.
+        ranked.sort(
+            key=lambda x: (
+                x['expected_prior'],
+                x['gain'],
+                -x['action']['cost'],
+            ),
+            reverse=True,
+        )
+
         return {
-            'baseline_two_switches': baseline_two_switches,
-            'baseline_two_switch_prob': baseline_two_switch_prob,
-            'best_observe': ranked[0],
+            'current_prior': current_prior,
+            'best': ranked[0],
             'ranked': ranked,
         }
 
-    def run_strategy_observe_switch_switch(self):
-        """Autonomous policy: observe one variable, then apply two interventions."""
-        report = self.choose_best_observation_for_oss()
-        best = report['best_observe']
-        if not best:
-            print('No observable variables left for strategy execution.')
-            return report
+    def run_greedy_prior_graph_policy(self):
+        """
+        Execute policy: from each node move to action with maximal expected prior.
+        Continues until no actions are feasible or points are exhausted.
+        """
+        print('=== Running Greedy Prior Graph Policy ===')
+        trajectory = []
 
-        print('=== Running Strategy: observe -> switch -> switch ===')
-        print(
-            f"Planned first observe: {best['observe_var']} "
-            f"(expected gain={best['expected_gain']:.6f}, "
-            f"P(improve)={best['prob_of_improvement']:.6f})"
-        )
-
-        observed_value = self.observe(best['observe_var'])
-        if observed_value is None:
-            return report
-
-        evidence_after_observe = dict(self.known_evidence)
-        best_two_switches, p_after_actions = self._find_best_two_switches(evidence_after_observe)
-        if best_two_switches is None:
-            print('No improving two-switch action found after observation.')
-            return report
-
-        switch1, switch2 = best_two_switches
-        (value1, value2), p_after_actions = self._best_assignment_for_two_switches(
-            evidence_after_observe, switch1, switch2
-        )
-        print(f'Planned action 1: {switch1} -> {value1}')
-        self.act(switch1, value1)
-        print(f'Planned action 2: {switch2} -> {value2}')
-        self.act(switch2, value2)
-        print(f'Estimated P(Crew_Status=safe) after plan: {p_after_actions:.6f}')
-
-        return {
-            **report,
-            'observed': (best['observe_var'], observed_value),
-            'actions': [(switch1, value1), (switch2, value2)],
-            'estimated_p_safe_after_actions': p_after_actions,
-        }
-
-    def run_strategy_switch_observe_switch(self):
-        """Autonomous policy: one intervention, one observation, one intervention."""
-        plan_report = self.choose_plan_switch_observe_switch()
-        best_plan = plan_report['best_plan']
-        if not best_plan:
-            print('No profitable switch->observe->switch plan found.')
-            return plan_report
-
-        first_switch, first_value = best_plan['first_switch']
-        print('=== Running Strategy: switch -> observe -> switch ===')
-        print(
-            f'Planned action 1: {first_switch} -> {first_value} '
-            f"(expected final P(Crew_Status=safe)={best_plan['expected_prob']:.6f})"
-        )
-        self.act(first_switch, first_value)
-
-        observed = None
-        if best_plan['observe_var'] is not None:
-            print(f"Planned observe: {best_plan['observe_var']}")
-            observed_value = self.observe(best_plan['observe_var'])
-            observed = (best_plan['observe_var'], observed_value)
-
-        second_action, second_prob = self._find_best_single_switch(
-            dict(self.known_evidence),
-            excluded_switches={first_switch},
-        )
-        if second_action is None:
-            print('No second switch improves the current state estimate.')
-            return {
-                **plan_report,
-                'observed': observed,
-                'actions': [(first_switch, first_value)],
-                'estimated_p_safe_after_actions': self._p_safe(dict(self.known_evidence)),
-            }
-
-        second_switch, second_value = second_action
-        print(f'Planned action 2: {second_switch} -> {second_value}')
-        self.act(second_switch, second_value)
-        print(f'Estimated P(Crew_Status=safe) after plan: {second_prob:.6f}')
-
-        return {
-            **plan_report,
-            'observed': observed,
-            'actions': [(first_switch, first_value), second_action],
-            'estimated_p_safe_after_actions': second_prob,
-        }
-
-    def run_strategy_observe_observe_observe_switch(self):
-        """Autonomous policy: three observations followed by one intervention."""
-        print('=== Running Strategy: observe -> observe -> observe -> switch ===')
-
-        observed_steps = []
-        for step in [1, 2, 3]:
-            available_observes = tuple(sorted(self.obs_vars - set(self.known_evidence.keys())))
-            if not available_observes:
-                print('No observable variables left before completing 3 observes.')
+        while self.action_points > 0:
+            decision = self.choose_best_next_action_by_prior()
+            best = decision['best']
+            if best is None:
+                print('No feasible actions left.')
                 break
 
-            best_observe = self._choose_best_observe_for_remaining_depth(
-                dict(self.known_evidence),
-                available_observes,
-                remaining_observes=4 - step,
-                excluded_switches=set(),
-            )
-            if not best_observe:
-                print('No suitable observe action found.')
-                break
+            action = best['action']
+            if action['kind'] == 'observe':
+                print(
+                    f"Choose observe {action['var']} "
+                    f"(expected prior={best['expected_prior']:.6f}, "
+                    f"gain={best['gain']:.6f})"
+                )
+                value = self.observe(action['var'])
+                trajectory.append({
+                    'action': action,
+                    'observed_value': value,
+                    'expected_prior': best['expected_prior'],
+                    'gain': best['gain'],
+                })
+                if value is None:
+                    break
+                continue
 
             print(
-                f"Planned observe {step}: {best_observe['observe_var']} "
-                f"(expected gain={best_observe['expected_gain']:.6f}, "
-                f"P(improve)={best_observe['prob_of_improvement']:.6f})"
+                f"Choose do {action['var']}={action['value']} "
+                f"(expected prior={best['expected_prior']:.6f}, "
+                f"gain={best['gain']:.6f})"
             )
-            value = self.observe(best_observe['observe_var'])
-            observed_steps.append((best_observe['observe_var'], value))
+            self.act(action['var'], action['value'])
+            trajectory.append({
+                'action': action,
+                'expected_prior': best['expected_prior'],
+                'gain': best['gain'],
+            })
 
-        best_switch_action, best_prob = self._find_best_single_switch(dict(self.known_evidence))
-        if best_switch_action is None:
-            print('No switch action improves the current estimate after observations.')
-            return {
-                'observed': observed_steps,
-                'actions': [],
-                'estimated_p_safe_after_actions': self._p_safe(dict(self.known_evidence)),
-            }
-
-        switch, value = best_switch_action
-        print(f'Planned final action: {switch} -> {value}')
-        self.act(switch, value)
-        print(f'Estimated P(Crew_Status=safe) after plan: {best_prob:.6f}')
-
+        final_prior = self._state_prior_p_safe(dict(self.known_evidence))
+        print(f'Final prior P(Crew_Status=safe): {final_prior:.6f}')
         return {
-            'observed': observed_steps,
-            'actions': [best_switch_action],
-            'estimated_p_safe_after_actions': best_prob,
+            'trajectory': trajectory,
+            'final_prior': final_prior,
+            'remaining_action_points': self.action_points,
         }
 
-    def run_strategy(self, strategy_name):
-        """Unified entrypoint for autonomous strategies."""
-        if strategy_name == 'observe_switch_switch':
-            return self.run_strategy_observe_switch_switch()
-        if strategy_name == 'switch_observe_switch':
-            return self.run_strategy_switch_observe_switch()
-        if strategy_name == 'observe_observe_observe_switch':
-            return self.run_strategy_observe_observe_observe_switch()
-        raise ValueError(
-            "Unknown strategy_name. Use one of: "
-            "observe_switch_switch, switch_observe_switch, observe_observe_observe_switch"
-        )
+    def get_descendants_of_do_var(self, do_var: str) -> Set[str]:
+        """
+        Получить всех потомков переменной action в DAG.
+        
+        :param do_var: переменная из DO_VARS
+        :return: множество всех переменных, зависимых от do_var
+        """
+        if do_var not in self.do_vars:
+            raise ValueError(f"{do_var} not in DO_VARS")
+        return self.graph._descendants_cache[do_var]
+    
+    def get_obs_descendants_of_do_var(self, do_var: str) -> Set[str]:
+        """
+        Получить только наблюдаемые потомки переменной action.
+        Именно эти переменные становятся неизвестными после действия.
+        
+        :param do_var: переменная из DO_VARS
+        :return: множество obs_vars, которые являются потомками do_var
+        """
+        if do_var not in self.do_vars:
+            raise ValueError(f"{do_var} not in DO_VARS")
+        return self.graph.get_obs_descendants(do_var)
+    
+    def print_mdp_graph_info(self):
+        """
+        Вывести информацию о структуре графа MDP.
+        Для каждой переменной action показать, какие obs_vars будут неизвестны после её применения.
+        """
+        print("=" * 70)
+        print("MARKOV DECISION PROCESS - GRAPH STRUCTURE")
+        print("=" * 70)
+        print(f"\nObservable variables (obs_vars): {sorted(self.obs_vars)}")
+        print(f"Action variables (do_vars): {sorted(self.do_vars)}")
+        print("\n" + "-" * 70)
+        print("EFFECT OF EACH ACTION:")
+        print("-" * 70)
+        
+        for do_var in sorted(self.do_vars):
+            all_descendants = self.get_descendants_of_do_var(do_var)
+            obs_descendants = self.get_obs_descendants_of_do_var(do_var)
+            
+            print(f"\n{do_var}:")
+            print(f"  All descendants: {sorted(all_descendants) if all_descendants else 'None'}")
+            print(f"  Observable descendants (become unknown after action):")
+            if obs_descendants:
+                for obs in sorted(obs_descendants):
+                    print(f"    - {obs}")
+            else:
+                print(f"    None")
+    
+    def simulate_action_effect(self, state: Dict, do_var: str, value) -> Dict:
+        """
+        Симулировать эффект действия на текущее состояние.
+        
+        State: множество известных переменных
+        Action: (do_var, value)
+        Next State: state с удаленными obs_descendants(do_var)
+        
+        :param state: текущее состояние (dict с известными переменными)
+        :param do_var: переменная для интервенции
+        :param value: значение для установки
+        :return: новое состояние после действия
+        """
+        if do_var not in self.do_vars:
+            raise ValueError(f"{do_var} not in DO_VARS")
+        
+        return self.graph.get_next_state(state, (do_var, value))
+    
+    def print_state_transition_example(self, do_var: str):
+        """
+        Показать пример перехода состояния при применении действия.
+        
+        :param do_var: переменная для интервенции
+        """
+        current_state = dict(self.known_evidence)
+        next_state = self.simulate_action_effect(current_state, do_var, None)
+        affected = current_state.keys() - next_state.keys()
+        
+        print(f"\nAction: {do_var}")
+        print(f"Current state: {self.graph.get_state_description(current_state) or 'Empty'}")
+        print(f"After action {do_var}:")
+        print(f"  Variables that become unknown: {sorted(affected) if affected else 'None'}")
+        print(f"  New state: {self.graph.get_state_description(next_state) or 'Empty'}")
+    
+    def export_graph_as_nx(self) -> nx.DiGraph:
+        """
+        Экспортировать граф Байесовской сети как NetworkX DiGraph.
+        Полезно для дальнейшего анализа структуры.
+        """
+        return self.graph.graph_nx.copy()
+    
+    def visualize_mdp_action_effects(self):
+        """
+        Вывести таблицу всех действий и их эффектов на obs_vars.
+        """
+        print("\n" + "=" * 90)
+        print("MDP ACTION EFFECTS TABLE")
+        print("=" * 90)
+        
+        # Найти максимальную длину для форматирования
+        max_do_len = max(len(v) for v in self.do_vars)
+        
+        for do_var in sorted(self.do_vars):
+            obs_desc = sorted(self.get_obs_descendants_of_do_var(do_var))
+            print(f"\n{do_var:<{max_do_len}} -> invalidates: {', '.join(obs_desc) if obs_desc else '(none)'}")
 
-    def estimate_strategy_priors(self):
-        """Estimate prior success probability for each available strategy."""
-        evidence = dict(self.known_evidence)
-        priors = {}
-
-        # observe -> switch -> switch
-        oss_report = self.choose_best_observation_for_oss()
-        if oss_report['best_observe'] is None:
-            priors['observe_switch_switch'] = self._p_safe(evidence)
-        else:
-            priors['observe_switch_switch'] = float(
-                oss_report['best_observe']['expected_prob_after_observe']
-            )
-
-        # switch -> observe -> switch
-        sos_report = self.choose_plan_switch_observe_switch()
-        if sos_report['best_plan'] is None:
-            priors['switch_observe_switch'] = float(sos_report['baseline_prob'])
-        else:
-            priors['switch_observe_switch'] = float(sos_report['best_plan']['expected_prob'])
-
-        # observe -> observe -> observe -> switch
-        available_observes = tuple(sorted(self.obs_vars - set(evidence.keys())))
-        ooos_depth = min(3, len(available_observes))
-        priors['observe_observe_observe_switch'] = float(
-            self._best_expected_prob_after_k_observes_then_switch(
-                evidence,
-                available_observes,
-                remaining_observes=ooos_depth,
-                excluded_switches=set(),
-                cache={},
-            )
-        )
-
-        return priors
-
-    def choose_best_strategy_by_prior(self):
-        """Choose strategy with maximum prior expected success probability."""
-        priors = self.estimate_strategy_priors()
-        best_strategy = max(priors, key=priors.get)
-        return {
-            'priors': priors,
-            'best_strategy': best_strategy,
-            'best_prior': priors[best_strategy],
-        }
-
-    def run_best_strategy_by_prior(self):
-        """Estimate priors, print comparison, and execute the best strategy."""
-        report = self.choose_best_strategy_by_prior()
-
-        print('=== Strategy Prior Comparison ===')
-        for strategy_name in [
-            'observe_switch_switch',
-            'switch_observe_switch',
-            'observe_observe_observe_switch',
-        ]:
-            print(
-                f"{strategy_name}: "
-                f"P(Crew_Status=safe)~{report['priors'][strategy_name]:.6f}"
-            )
-        print(
-            f"Selected strategy: {report['best_strategy']} "
-            f"(prior={report['best_prior']:.6f})"
-        )
-
-        result = self.run_strategy(report['best_strategy'])
-        return {
-            **report,
-            'execution_result': result,
-        }
 
 
 if __name__ == '__main__':
     bn = BIFReader('spaceship.bif').get_model()
 
     # ini_state = {'O2_Level': 'low', 'Temperature': 'cold', 'Alert_System': 'warning', 'Diagnosis': 'nominal'}
-    ini_state = {'O2_Level': 'low', 'Alert_System': 'warning', 'Diagnosis': 'anomaly'}
+    # ini_state = {'O2_Level': 'low', 'Alert_System': 'warning', 'Diagnosis': 'anomaly'}
     # ini_state = {'Temperature': 'hot', 'Alert_System': 'silent', 'Diagnosis': 'nominal'}
-    # ini_state = {'AI_Test': 'pass', 'Temperature': 'hot', 'O2_Level': 'low', 'Alert_System': 'silent', 'Diagnosis': 'nominal'}
+    ini_state = {'AI_Test': 'pass', 'Temperature': 'hot', 'O2_Level': 'low', 'Alert_System': 'silent', 'Diagnosis': 'nominal'}
     # ini_state = {'CO2_Level': 'high', 'Alert_System': 'silent', 'Porthole': 'danger'}
     run_seed = random.SystemRandom().randrange(0, 2**32)
     print(f'Run seed: {run_seed}')
     env = SpaceOdysseySimulator(bn, initial_state=ini_state, seed=run_seed)
 
-    env.run_best_strategy_by_prior()
-    # env.run_strategy('observe_switch_switch')
+    env.run_greedy_prior_graph_policy()
     env.finish()
